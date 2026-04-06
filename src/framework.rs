@@ -1,0 +1,25 @@
+// 核心 Trait 与事件定义
+use anyhow::Result;
+use ratatui::prelude::*;
+
+#[derive(Debug, Clone)]
+pub enum CustomAction {
+    UpdateCpu(f32),
+    UpdateMemory { used: u64, total: u64 }, // 新增：内存数据
+    ToggleSidebar,
+    NextApp,
+    SetHistory(usize), // 新增：动态调整历史点数
+    ResizeSidebar(u16), // 新增：设置侧边栏绝对宽度
+}
+
+pub enum AppEvent {
+    Tick,
+    Key(crossterm::event::KeyEvent),
+    Mouse(crossterm::event::MouseEvent),
+    Action(CustomAction), 
+}
+
+pub trait Component {
+    fn handle_event(&mut self, event: &AppEvent) -> Result<Option<CustomAction>>;
+    fn render(&self, frame: &mut Frame, area: Rect);
+}
