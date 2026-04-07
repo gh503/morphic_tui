@@ -46,8 +46,15 @@ impl Sidebar {
             Style::default().fg(Color::Gray)
         };
 
+        let info_style = if *active_tab == ActiveApp::Info {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
         let monitor_prefix = if *active_tab == ActiveApp::Monitor { "> " } else { "  " };
         let settings_prefix = if *active_tab == ActiveApp::Settings { "> " } else { "  " };
+        let info_prefix = if *active_tab == ActiveApp::Info { "> " } else { "  " };
 
         // 3. 构建 UI 文本
         let mut text = vec![
@@ -71,6 +78,10 @@ impl Sidebar {
         text.push(Line::from(vec![
             Span::styled(settings_prefix, settings_style),
             Span::styled("Settings", settings_style),
+        ]));
+        text.push(Line::from(vec![
+            Span::styled(info_prefix, info_style),
+            Span::styled("Info", info_style),
         ]));
         
         // 底部帮助区

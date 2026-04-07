@@ -677,6 +677,7 @@ dependencies = [
  "anyhow",
  "confy",
  "crossterm",
+ "mac_address",
  "ratatui",
  "serde",
  "sysinfo",
