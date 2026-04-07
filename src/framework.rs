@@ -10,6 +10,12 @@ pub enum CustomAction {
     NextApp,
     SetHistory(usize), // 新增：动态调整历史点数
     ResizeSidebar(u16), // 新增：设置侧边栏绝对宽度
+
+    RefreshData,          // 意图：发起刷新
+    SyncDatabaseFinished, // 意图：刷新完成信号
+    NotifySuccess(String),        // 意图：操作成功，要求系统弹出提示（Toast）
+    NotifyError(String),          // 意图：操作失败
+    UpdateTaskStatus { id: String, status: String }, // 意图：更新任务状态
 }
 
 pub enum AppEvent {

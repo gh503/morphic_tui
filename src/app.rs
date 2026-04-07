@@ -4,6 +4,7 @@ use crate::config::AppConfig;
 use crate::apps::monitor::MonitorApp;
 use crate::apps::settings::SettingsApp;
 use crate::apps::info::InfoApp;
+use crate::apps::quality::QualityApp;
 use crate::components::Sidebar;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders};
@@ -17,6 +18,7 @@ pub struct RootApp {
     pub monitor: MonitorApp,
     pub settings: SettingsApp,
     pub info: InfoApp,
+    pub quality: QualityApp,
     pub sidebar: Sidebar,
     pub sidebar_width: u16,  // 用户设定的目标常态宽度
 
@@ -32,7 +34,7 @@ pub struct RootApp {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub enum ActiveApp { Monitor, Settings, Info, }
+pub enum ActiveApp { Monitor, Settings, Info, Quality }
 
 impl RootApp {
     pub fn new() -> Self {
@@ -55,6 +57,7 @@ impl RootApp {
             monitor,
             settings: SettingsApp { current_points: settings_points },
             info: InfoApp::new(),
+            quality: QualityApp::new(),
             sidebar: Sidebar::new(),
             sidebar_width: sidebar_w,
             
@@ -75,31 +78,24 @@ impl RootApp {
         };
         let _ = confy::store("morphic_tui", None, cfg);
     }
-
+    
     pub fn handle_event(&mut self, event: &AppEvent) -> anyhow::Result<Option<CustomAction>> {
         let mut pending_action = None;
 
+        // --- 1. 全局事件处理 (保持不变) ---
         match event {
             AppEvent::Mouse(mouse) => {
-                // 1. 节流处理 (16ms 约等于 60fps)
                 if let MouseEventKind::Drag(_) = mouse.kind {
                     if self.last_drag_time.elapsed() < Duration::from_millis(16) {
                         return Ok(None); 
                     }
                     self.last_drag_time = Instant::now();
                 }
-
-                // 2. 核心修复：获取当前的动画宽度（视觉真实宽度）
                 let visual_width = *self.current_sidebar_width.borrow() as u16;
                 let current_size = *self.last_size.borrow();
-                
-                // 构建基于当前动画进度的判定区
                 let sidebar_area = Rect::new(current_size.x, current_size.y, visual_width, current_size.height);
-
-                // 3. 传入视觉 Rect 进行判定
                 pending_action = self.handle_mouse_logic(*mouse, sidebar_area);
             }
-
             AppEvent::Key(k) => {
                 match k.code {
                     crossterm::event::KeyCode::Tab => pending_action = Some(CustomAction::NextApp),
@@ -107,7 +103,6 @@ impl RootApp {
                     _ => {}
                 }
             }
-
             AppEvent::Action(action) => {
                 match action {
                     CustomAction::ToggleSidebar => {
@@ -119,7 +114,8 @@ impl RootApp {
                         self.active_tab = match self.active_tab {
                             ActiveApp::Monitor => ActiveApp::Settings,
                             ActiveApp::Settings => ActiveApp::Info,
-                            ActiveApp::Info => ActiveApp::Monitor,
+                            ActiveApp::Info => ActiveApp::Quality,
+                            ActiveApp::Quality => ActiveApp::Monitor,
                         };
                     }
                     _ => {}
@@ -128,12 +124,28 @@ impl RootApp {
             _ => {}
         }
 
-        // 4. 转发给子组件
-        let _ = self.monitor.handle_event(event)?;
-        let _ = self.sidebar.handle_event(event)?;
+        // --- 2. [核心优化] 转发给子组件：按需分发 ---
         
-        if let Some(a) = self.settings.handle_event(event)? { return Ok(Some(a)); }
-        if let Some(a) = self.info.handle_event(event)? { return Ok(Some(a)); }
+        // 侧边栏是全局组件，始终接收事件（用于处理内部动画或菜单点击）
+        let _ = self.sidebar.handle_event(event)?;
+
+        // 仅将事件分发给当前活跃的 Tab
+        // 这样当 active_tab 不是 Monitor 时，MonitorApp 就永远收不到 Tick，后台扫描彻底停止
+        match self.active_tab {
+            ActiveApp::Monitor => {
+                if let Some(a) = self.monitor.handle_event(event)? { pending_action = Some(a); }
+            }
+            ActiveApp::Info => {
+                if let Some(a) = self.info.handle_event(event)? { pending_action = Some(a); }
+            }
+            ActiveApp::Quality => {
+                // QualityApp 如果有 Action 也需要接收
+                let _ = self.quality.handle_event(event)?;
+            }
+            ActiveApp::Settings => {
+                if let Some(a) = self.settings.handle_event(event)? { pending_action = Some(a); }
+            }
+        }
 
         Ok(pending_action)
     }
@@ -227,6 +239,7 @@ impl RootApp {
             ActiveApp::Monitor => self.monitor.render(f, chunks[1]),
             ActiveApp::Settings => self.settings.render(f, chunks[1]),
             ActiveApp::Info => self.info.render(f, chunks[1]),
+            ActiveApp::Quality => self.quality.render(f, chunks[1]),
         }
     }
 }

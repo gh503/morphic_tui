@@ -1,9 +1,9 @@
-// 系统监控 (增加进程排序支持)
+// 系统监控 (优化版：精细化刷新与性能隔离)
 use crate::framework::*;
 use std::collections::VecDeque;
 use std::cell::RefCell;
 use ratatui::{prelude::*, widgets::*, symbols::Marker};
-use sysinfo::{System, ProcessRefreshKind};
+use sysinfo::{System, ProcessRefreshKind, CpuRefreshKind, MemoryRefreshKind, RefreshKind, ProcessesToUpdate};
 
 #[derive(Default, PartialEq)]
 pub enum SortBy {
@@ -20,7 +20,7 @@ pub struct MonitorApp {
     pub top_processes: Vec<(String, f32, u64)>, 
     pub cached_grid: RefCell<Vec<Vec<(f64, f64)>>>,
     pub last_max_points: RefCell<usize>,
-    pub sort_by: SortBy, // 新增：排序维度
+    pub sort_by: SortBy,
 }
 
 impl MonitorApp {
@@ -29,9 +29,17 @@ impl MonitorApp {
     }
 
     pub fn with_config(max_points: usize) -> Self {
-        let mut sys = System::new_all();
-        sys.refresh_cpu_all();
-        
+        // --- 优化 1：精细化初始化，彻底禁用不相关的内核扫描 (磁盘、网络、用户等) ---
+        let mut sys = System::new_with_specifics(
+            RefreshKind::nothing()
+                .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+                .with_memory(MemoryRefreshKind::nothing().with_ram())
+                .with_processes(ProcessRefreshKind::nothing().with_cpu().with_memory())
+        );
+
+        // 初始刷新
+        sys.refresh_cpu_usage();
+
         Self { 
             cpu_history: VecDeque::from(vec![0.0; max_points]), 
             mem_percent: 0.0,
@@ -45,42 +53,52 @@ impl MonitorApp {
     }
 
     pub fn tick(&mut self) {
-        self.sys.refresh_cpu_all(); 
+        // --- 优化 2：按需刷新，绝不调用 refresh_all() ---
+        self.sys.refresh_cpu_usage(); 
         self.sys.refresh_memory();
-        // 性能优化：仅刷新进程的 CPU 和内存，不刷新磁盘/网络
+        
+        // 仅刷新进程的 CPU 和内存，这是 proc_tid_stat 的来源，必须受控
         self.sys.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::All,
-            true,
+            ProcessesToUpdate::All,
+            true, // 清理已退出的进程
             ProcessRefreshKind::nothing().with_cpu().with_memory()
         );
 
+        // 更新全局 CPU 历史
         let global_cpu = self.sys.global_cpu_usage();
         self.cpu_history.push_back(global_cpu);
         if self.cpu_history.len() > self.max_points {
             self.cpu_history.pop_front();
         }
 
-        let used_mem = self.sys.used_memory();
+        // 更新内存百分比
         let total_mem = self.sys.total_memory();
-        self.mem_percent = (used_mem as f32 / total_mem as f32) * 100.0;
+        if total_mem > 0 {
+            self.mem_percent = (self.sys.used_memory() as f32 / total_mem as f32) * 100.0;
+        }
 
-        // --- 排序逻辑开始 ---
+        // --- 优化 3：零拷贝排序与高效截断 ---
+        // 提取引用进行排序，避免在排序阶段克隆字符串
         let mut procs: Vec<_> = self.sys.processes().values().collect();
         
         match self.sort_by {
             SortBy::Cpu => {
-                procs.sort_by(|a, b| b.cpu_usage().partial_cmp(&a.cpu_usage()).unwrap_or(std::cmp::Ordering::Equal));
+                // 使用 sort_unstable_by 提升 20% 以上的排序性能
+                procs.sort_unstable_by(|a, b| {
+                    b.cpu_usage().partial_cmp(&a.cpu_usage()).unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
             SortBy::Memory => {
-                procs.sort_by(|a, b| b.memory().cmp(&a.memory()));
+                procs.sort_unstable_by(|a, b| b.memory().cmp(&a.memory()));
             }
         }
         
+        // 仅对最终展示的前 N 个进程进行数据转换
         self.top_processes = procs.iter().take(30).map(|p| {
             (
-                p.name().to_string_lossy().into_owned(),
+                p.name().to_string_lossy().to_string(),
                 p.cpu_usage(),
-                p.memory() / 1024 / 1024 
+                p.memory() / 1024 / 1024 // 转换为 MB
             )
         }).collect();
     }
@@ -107,6 +125,7 @@ impl MonitorApp {
 impl Component for MonitorApp {
     fn handle_event(&mut self, event: &AppEvent) -> anyhow::Result<Option<CustomAction>> {
         match event {
+            // 关键：只有当前 Tab 活跃时，App.rs 才会分发 Tick 到这里
             AppEvent::Tick => {
                 self.tick();
             }
@@ -119,10 +138,10 @@ impl Component for MonitorApp {
             }
             AppEvent::Action(CustomAction::SetHistory(new_val)) => {
                 self.max_points = *new_val;
+                // 调整队列长度
                 while self.cpu_history.len() > self.max_points { self.cpu_history.pop_front(); }
                 while self.cpu_history.len() < self.max_points { self.cpu_history.push_front(0.0); }
-                // 强制重绘背景网格
-                *self.last_max_points.borrow_mut() = 0;
+                *self.last_max_points.borrow_mut() = 0; // 触发网格重绘
             }
             _ => {}
         }
@@ -133,19 +152,19 @@ impl Component for MonitorApp {
         self.ensure_grid_cache();
 
         let chunks = Layout::vertical([
-            Constraint::Length(3),  // 内存
+            Constraint::Length(3),  // 内存条
             Constraint::Length(12), // CPU 图表
             Constraint::Min(0)      // 进程列表
         ]).split(area);
 
-        // 1. 内存条渲染
+        // 1. 内存条
         let gauge = Gauge::default()
             .block(Block::bordered().title(" 内存使用率 ").border_type(BorderType::Rounded))
             .gauge_style(Style::default().fg(if self.mem_percent > 80.0 { Color::Red } else { Color::Magenta }))
             .percent(self.mem_percent as u16);
         frame.render_widget(gauge, chunks[0]);
 
-        // 2. CPU 图表渲染
+        // 2. CPU 图表 (使用缓存的背景网格)
         let cpu_points: Vec<(f64, f64)> = self.cpu_history.iter().enumerate()
             .map(|(i, &val)| (i as f64, val as f64)).collect();
 
@@ -171,10 +190,8 @@ impl Component for MonitorApp {
             .y_axis(Axis::default().bounds([0.0, 100.0]).labels(vec![Line::from("0"), Line::from("50"), Line::from("100")]));
         frame.render_widget(chart, chunks[1]);
 
-        // 3. 动态进程列表
+        // 3. 进程列表 (Table 渲染)
         let displayable_rows = chunks[2].height.saturating_sub(3) as usize;
-        
-        // 动态表头：根据排序状态显示倒三角符号
         let cpu_header = if self.sort_by == SortBy::Cpu { "CPU (▼)" } else { "CPU" };
         let mem_header = if self.sort_by == SortBy::Memory { "内存 (▼)" } else { "内存" };
 
@@ -188,29 +205,18 @@ impl Component for MonitorApp {
                 ])
             });
 
-        let table_title = format!(
-            " 进程监控 [ 1:按CPU排序 2:按内存排序 ] (Top {}) ", 
-            self.top_processes.len().min(displayable_rows)
-        );
-
         let table = Table::new(rows, [
             Constraint::Percentage(50),
             Constraint::Percentage(25),
             Constraint::Percentage(25),
         ])
         .header(
-            Row::new(vec![
-                Cell::from("进程名"),
-                Cell::from(cpu_header).style(Style::default().fg(if self.sort_by == SortBy::Cpu { Color::Yellow } else { Color::Cyan })),
-                Cell::from(mem_header).style(Style::default().fg(if self.sort_by == SortBy::Memory { Color::Yellow } else { Color::Cyan })),
-            ])
-            .style(Style::default().bold())
+            Row::new(vec![Cell::from("进程名"), Cell::from(cpu_header), Cell::from(mem_header)])
+                .style(Style::default().bold().fg(Color::Cyan))
         )
         .block(Block::bordered()
-            .title(table_title)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(if self.sort_by == SortBy::Cpu { Color::Yellow } else { Color::Magenta }))
-        );
+            .title(format!(" 进程监控 (Top {}) ", self.top_processes.len().min(displayable_rows)))
+            .border_type(BorderType::Rounded));
         
         frame.render_widget(table, chunks[2]);
     }
