@@ -1,5 +1,6 @@
 // 框架设置 (增加终端交互指南)
 use crate::framework::*;
+use crate::config::AppConfig;
 use ratatui::{prelude::*, widgets::*};
 
 pub struct SettingsApp {
@@ -43,7 +44,7 @@ impl Component for SettingsApp {
         Ok(None)
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect) {
+    fn render(&self, frame: &mut Frame, area: Rect, _config: &AppConfig) {
         // --- 布局规划 ---
         // 1. 核心参数 (Length 9)
         // 2. 实时分析 (Min 10)

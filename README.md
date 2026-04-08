@@ -1,58 +1,57 @@
 # Morphic TUI
 
-一个基于 Rust 和 Ratatui 构建的轻量级、跨平台终端系统监控工具。专为开发者、SDET 及 Linux 运维工程师设计，旨在提供极致的实时性能观测体验。
+一个基于 Rust 和 Ratatui 构建的、面向 SDET 和质量工程的系统监控与管理终端工具。
 
+## 🚀 核心特性 (Core Features)
 
+* **📊 性能监控 (Performance Monitor)**：基于 `sysinfo` 的实时 CPU 与内存负载分析，支持可配置的采样深度和动态背景网格渲染。
+* **⚙️ 动态配置架构 (Config-Driven Architecture)**：
+    * **全组件同步**：全局 `AppConfig` 实时驱动各子应用布局。
+    * **列定义引擎**：支持通过 `config.toml` 动态配置表格列（名称、宽度、可见性）。
+* **🛡️ 质量视角 (Quality Insight)**：内置项目管理、缺陷跟踪和验收标准视图，助力质量负责人（Quality Lead）掌控全局。
+* **🖱️ 交互式 UI (Interactive UI)**：支持侧边栏动画、鼠标拖拽调节宽度以及 Tab 快速切换。
+* **⚡ 极致性能优化**：
+    * **按需分发**：仅对活跃 Tab 进行事件分发，非活跃组件零 CPU 占用。
+    * **缓存机制**：背景网格与硬件信息通过 `RefCell` 和 `Instant` 实现精细化缓存刷新。
 
-## 🌟 核心特性
+## 🛠️ 配置说明 (Configuration)
 
-* **实时性能洞察**：集成 `sysinfo` 31+，实时追踪 CPU 负载（基于 `/proc/stat` 差值算法）与内存使用率。
-* **动态进程监控**：自动按 CPU 占用排序，支持根据终端窗口高度自适应显示进程数量。
-* **可视化采样深度**：
-    * 支持 **10 - 200** 个历史采样点动态调节。
-    * **瞬时模式**：捕捉毫秒级的性能尖峰。
-    * **趋势模式**：观察长达 40 秒的任务负载走向。
-* **响应式侧边栏**：集成导航菜单与实时状态看板，边框颜色随系统负载智能跳变。
-* **极致轻量**：无重型框架依赖，内存占用 < 20MB，完美运行于 openEuler (ARM64) 虚拟机及家庭 NAS (FnOS)。
+配置文件通常位于 `~/.config/morphic_tui/default-config.toml`。
 
-## 🚀 快速开始
-
-### 前置要求
-* **Rust**: 1.75.0+
-* **平台支持**: Windows, Ubuntu, openEuler, macOS
-
-### 安装与运行
-```bash
-# 克隆仓库
-git clone https://github.com/your-username/morphic_tui.git
-cd morphic_tui
-
-# 安装依赖并编译运行
-cargo run --release
+### 采样点配置
+在“设置”页面调整采样点，系统会自动持久化并同步所有组件的渲染轴：
+```toml
+max_points = 100 # CPU 历史图表采样深度
 ```
 
-## 🛠️ 配置说明 (Settings)
+### 表格列配置 (Table Columns)
+你可以自定义任何表格的展示维度：
+```toml
+[table_columns]
+projects = [
+    { name = "项目名称", width = 60, visible = true, sort = "None" },
+    { name = "状态", width = 40, visible = true, sort = "None" }
+]
+# 支持 tasks, bugs, acceptance, assets 等多个 Tab 定义
+```
 
-在应用内切换至 `Settings` 页面，你可以通过 `↑` / `↓` 键实时调整 **采样深度**：
-
-| 采样点数 | 覆盖时长 | 应用场景 |
-| :--- | :--- | :--- |
-| **10 - 40** | 2s - 8s | **SDET 视角**：捕捉自动化脚本启动瞬间的资源争抢。 |
-| **50 - 120** | 10s - 24s | **标准模式**：日常开发与系统负载基准监控。 |
-| **130 - 200** | 26s - 40s | **运维视角**：观察代码编译、数据同步等长时任务趋势。 |
-
-## 📐 技术架构
-
-* **UI 引擎**: [Ratatui](https://github.com/ratatui-org/ratatui) - 现代化终端 UI 库。
-* **数据源**: [sysinfo](https://github.com/GuillaumeGomez/sysinfo) - 跨平台系统接口。
-* **布局逻辑**: 采用分层约束布局（Constraint Layout），确保在不同尺寸的终端下均能完美呈现。
-* **设计模式**: 基于单一真理来源（Single Source of Truth）的数据流转架构，确保侧边栏与主视图状态实时同步。
-
-## ⌨️ 快捷键
+## ⌨️ 操作指南 (Keymap)
 
 | 按键 | 功能 |
 | :--- | :--- |
-| `Tab` | 快速切换监控面板与设置页面 |
-| `B` | 切换侧边栏显示/隐藏 |
-| `↑ / ↓` | (设置页) 增减采样点深度 |
-| `Q / Ctrl+C` | 退出应用 |
+| `Tab` | 循环切换功能模块 (Monitor -> Settings -> Info -> Quality) |
+| `b` | 展开/收起侧边栏 (带缓动动画) |
+| `↑ / ↓` | (设置页) 动态调整 CPU 采样频率/深度 |
+| `1 / 2` | (监控页) 按 CPU 或 内存对进程排序 |
+| `f` | (质量页) 切换表头聚焦模式，开启排序逻辑 |
+| `Shift + 鼠标` | 强制文本选区（绕过 TUI 捕获） |
+
+## 🏗️ 架构愿景 (Architecture)
+
+
+
+项目采用**单向数据流**设计：
+1. **Event** 被 `RootApp` 捕获。
+2. **Action** 由子组件反馈并统一在 `app.rs` 调度中心处理。
+3. **State** 同步更新至全局 `AppConfig`。
+4. **Render** 阶段所有组件共享配置快照，确保 UI 最终一致性。

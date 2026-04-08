@@ -1,23 +1,41 @@
 use crate::framework::*;
 use crate::models::*;
 use crate::database::Database;
+use crate::config::{AppConfig, SortOrder};
 use std::sync::Arc;
 use sqlx::{SqlitePool, Row};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect, Alignment},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, BorderType},
+    widgets::{Block, Borders, Table, Row as TuiRow, Cell, Paragraph, Tabs, BorderType, TableState, Clear, Wrap},
     Frame,
-    prelude::Stylize,
+    prelude::*,
 };
-use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent};
+use anyhow::{Result, Context};
+use crossterm::event::KeyCode;
+use std::cell::RefCell;
 
-#[derive(Debug, PartialEq, Eq)] // 增加 PartialEq 方便模式判断
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum QualityMode {
-    Normal,   // 浏览模式 (按 1-5 换 Tab)
-    Editing,  // 编辑模式 (此时 q, b 等全局键应失效)
-    Confirm,  // 确认模式 (二次确认弹窗)
+    Normal,
+    HeaderFocus, 
+    Editing,
+}
+
+// --- 数据模型 ---
+#[derive(sqlx::FromRow, Debug, Clone)]
+pub struct TaskRecord {
+    pub title: String,
+    pub status: String,
+    pub priority: i32,
+}
+
+#[derive(sqlx::FromRow, Debug, Clone)]
+pub struct BugRecord {
+    pub id: i32,
+    pub title: String,
+    pub severity: String,
+    pub status: String,
 }
 
 pub struct QualityApp {
@@ -25,22 +43,34 @@ pub struct QualityApp {
     pub pool: Option<Arc<SqlitePool>>,
     pub is_loading: bool,
     pub active_tab: usize,
-    // --- 动态数据缓存 ---
+    
+    // --- 交互状态 ---
+    pub table_state: RefCell<TableState>,      
+    pub column_index: usize,                   
+    pub focus_on_detail: bool,                 
+    
+    // --- 缓存数据 ---
     pub projects: Vec<Project>,    
-    pub tasks: Vec<String>,       
-    pub bugs: Vec<String>,        
+    pub tasks: Vec<TaskRecord>,       
+    pub bugs: Vec<BugRecord>,        
     pub acceptance: Vec<String>,  
-    pub assets: Vec<String>,      
+    pub assets: Vec<(String, String)>,         
     pub error_msg: Option<String>,
 }
 
 impl QualityApp {
     pub fn new() -> Self {
+        let mut ts = TableState::default();
+        ts.select(Some(0));
+
         Self {
             mode: QualityMode::Normal,
             pool: None,
             is_loading: false,
             active_tab: 0,
+            table_state: RefCell::new(ts),
+            column_index: 0,
+            focus_on_detail: false,
             projects: Vec::new(),
             tasks: Vec::new(),
             bugs: Vec::new(),
@@ -50,200 +80,283 @@ impl QualityApp {
         }
     }
 
-    pub async fn ensure_db(&mut self) -> Result<()> {
-        if self.pool.is_some() { 
-            return Ok(()); 
+    fn get_current_tab_key(&self) -> &'static str {
+        match self.active_tab {
+            0 => "projects",
+            1 => "tasks",
+            2 => "bugs",      // Tab 3
+            3 => "acceptance",
+            4 => "assets",
+            _ => "default",
         }
-        
-        self.is_loading = true;
-        let db_url = "sqlite:data/quality.sqlite"; 
-        
-        match Database::init(db_url).await {
-            Ok(db) => {
-                self.pool = Some(Arc::new(db.pool));
-                self.error_msg = None; // 清除之前的错误
-                // 注意：这里可以调用 refresh_data，但为了异步安全，建议让 main 循环控制
-                self.refresh_data().await?;
-            }
-            Err(e) => {
-                self.is_loading = false; // 出错要重置状态
-                self.error_msg = Some(format!("DB Connect Failed: {}", e));
-                return Err(anyhow::anyhow!("Database Connect error: {}", e));
-            }
-        }
+    }
 
-        Ok(())
+    pub fn toggle_sort(&mut self, config: &mut AppConfig) {
+        let key = self.get_current_tab_key();
+        if let Some(cols) = config.table_columns.get_mut(key) {
+            if self.column_index < cols.len() {
+                if let Some(col) = cols.get_mut(self.column_index) {
+                    col.sort = match col.sort {
+                        SortOrder::None => SortOrder::Asc,
+                        SortOrder::Asc => SortOrder::Desc,
+                        SortOrder::Desc => SortOrder::None,
+                    };
+                    let order = col.sort.clone();
+                    let col_name = col.name.clone();
+                    self.apply_sort(key, &col_name, order);
+                }
+            }
+        }
+    }
+
+    fn apply_sort(&mut self, key: &str, col_name: &str, order: SortOrder) {
+        if order == SortOrder::None { return; }
+        let asc = order == SortOrder::Asc;
+
+        match key {
+            "tasks" => self.tasks.sort_by(|a, b| {
+                let res = match col_name.to_lowercase().as_str() {
+                    "status" => a.status.cmp(&b.status),
+                    "priority" => a.priority.cmp(&b.priority),
+                    _ => a.title.cmp(&b.title),
+                };
+                if asc { res } else { res.reverse() }
+            }),
+            "bugs" => self.bugs.sort_by(|a, b| {
+                let res = match col_name.to_lowercase().as_str() {
+                    "id" => a.id.cmp(&b.id),
+                    "级别" | "severity" => a.severity.cmp(&b.severity),
+                    "状态" | "status" => a.status.cmp(&b.status),
+                    _ => a.title.cmp(&b.title),
+                };
+                if asc { res } else { res.reverse() }
+            }),
+            _ => {}
+        }
     }
 
     pub async fn refresh_data(&mut self) -> Result<()> {
-        let pool = match &self.pool {
-            Some(p) => p,
-            None => return Ok(()),
-        };
+        let pool = self.pool.as_ref().context("No DB Pool")?;
 
-        // 1. 项目查询
-        let project_query = sqlx::query_as::<_, Project>(
-            r#"SELECT `id`, `model_id`, `name`, `status`, `created_at`, `updated_at`, `created_by`, `updated_by` FROM `projects`"#
-        )
-        .fetch_all(&**pool)
-        .await;
+        // Projects
+        self.projects = sqlx::query_as::<_, Project>("SELECT * FROM projects").fetch_all(&**pool).await.unwrap_or_default();
+        
+        // Tasks
+        let task_rows = sqlx::query("SELECT title, status, priority FROM tasks").fetch_all(&**pool).await.unwrap_or_default();
+        self.tasks = task_rows.iter().map(|r| TaskRecord {
+            title: r.get("title"), status: r.get("status"), priority: r.get("priority")
+        }).collect();
 
-        match project_query {
-            Ok(data) => self.projects = data,
-            Err(e) => self.error_msg = Some(format!("Projects Error: {}", e)),
-        }
+        // Bugs (Tab 3)
+        let bug_rows = sqlx::query("SELECT id, title, severity, status FROM bugs").fetch_all(&**pool).await.unwrap_or_default();
+        self.bugs = bug_rows.iter().map(|r| BugRecord {
+            id: r.get("id"), title: r.get("title"), severity: r.get("severity"), status: r.get("status")
+        }).collect();
 
-        // 2. 其他表数据拉取
-        if let Ok(rows) = sqlx::query("SELECT `title` FROM `tasks` LIMIT 20").fetch_all(&**pool).await {
-            self.tasks = rows.iter().map(|r| r.get::<String, _>("title")).collect();
-        }
-
-        if let Ok(rows) = sqlx::query("SELECT `title`, `severity` FROM `bugs` ORDER BY `severity` ASC").fetch_all(&**pool).await {
-            self.bugs = rows.iter().map(|r| {
-                let sev = r.try_get::<String, _>("severity").unwrap_or_else(|_| "N/A".into());
-                let title = r.try_get::<String, _>("title").unwrap_or_else(|_| "Unknown".into());
-                format!("[{}] {}", sev, title)
-            }).collect();
-        }
-
-        if let Ok(rows) = sqlx::query("SELECT `criteria` FROM `acceptance_criteria`").fetch_all(&**pool).await {
-            self.acceptance = rows.iter().map(|r| r.get::<String, _>("criteria")).collect();
-        }
-
-        if let Ok(rows) = sqlx::query("SELECT `name`, `status` FROM `assets`").fetch_all(&**pool).await {
-            self.assets = rows.iter().map(|r| {
-                format!("{} - {}", r.get::<String, _>("name"), r.get::<String, _>("status"))
-            }).collect();
-        }
+        // Acceptance & Assets
+        let acc_rows = sqlx::query("SELECT criteria FROM acceptance_criteria").fetch_all(&**pool).await.unwrap_or_default();
+        self.acceptance = acc_rows.iter().map(|r| r.get::<String, _>("criteria")).collect();
+        
+        let asset_rows = sqlx::query("SELECT name, status FROM assets").fetch_all(&**pool).await.unwrap_or_default();
+        self.assets = asset_rows.iter().map(|r| (r.get("name"), r.get("status"))).collect();
 
         Ok(())
     }
 
-    // --- 渲染辅助方法 ---
-    fn render_biz_tab(&self, f: &mut Frame, area: Rect) {
-        if self.projects.is_empty() {
-            let empty_text = Paragraph::new("暂无项目数据，请检查数据库表 projects")
-                .gray()
-                .alignment(Alignment::Center);
-            f.render_widget(empty_text, area);
-            return;
+    pub async fn ensure_db(&mut self) -> Result<()> {
+        if self.pool.is_some() { return Ok(()); }
+        self.is_loading = true;
+        match Database::init("sqlite:data/quality.sqlite").await {
+            Ok(db) => {
+                self.pool = Some(Arc::new(db.pool));
+                self.refresh_data().await?;
+                self.is_loading = false;
+                Ok(())
+            }
+            Err(e) => {
+                self.is_loading = false;
+                self.error_msg = Some(e.to_string());
+                Err(e)
+            }
         }
-        let items: Vec<ListItem> = self.projects.iter()
-            .map(|p| {
-                let status_color = if p.status.to_string() == "Active" { Color::Green } else { Color::Gray };
-                ListItem::new(format!(" 📦 {:<15} | {}", p.name, p.status)).style(Style::default().fg(status_color))
-            }).collect();
-
-        f.render_widget(List::new(items).block(Block::default().title(" 项目/型号列表 ").borders(Borders::ALL).border_type(BorderType::Rounded)).highlight_style(Style::default().add_modifier(Modifier::REVERSED)), area);
     }
 
-    fn render_task_tab(&self, f: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = self.tasks.iter().map(|t| ListItem::new(format!(" 🚀 {}", t)).cyan()).collect();
-        f.render_widget(List::new(items).block(Block::default().title(" 研发流水线 ").borders(Borders::ALL)), area);
+    fn render_master_table(&self, f: &mut Frame, area: Rect, config: &AppConfig) {
+        let key = self.get_current_tab_key();
+        
+        // 关键修复：如果 config 里没有该 Tab 的配置，给一组默认展示列，防止界面空白
+        let empty_vec = vec![];
+        let cols = config.table_columns.get(key).unwrap_or(&empty_vec);
+        
+        if cols.is_empty() {
+             f.render_widget(Paragraph::new(format!("请在 config.json 中配置 [{}] 的列信息", key)).dark_gray().alignment(Alignment::Center), area);
+             return;
+        }
+
+        let header_cells = cols.iter().enumerate().map(|(i, c)| {
+            let mut label = c.name.clone();
+            match c.sort {
+                SortOrder::Asc => label.push_str(" ▲"),
+                SortOrder::Desc => label.push_str(" ▼"),
+                _ => {}
+            }
+            let mut style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+            if self.mode == QualityMode::HeaderFocus && i == self.column_index {
+                style = style.bg(Color::Cyan).fg(Color::Black);
+            }
+            Cell::from(label).style(style)
+        });
+
+        let rows: Vec<TuiRow> = match self.active_tab {
+            0 => self.projects.iter().map(|p| TuiRow::new(vec![p.name.clone(), p.status.to_string()])).collect(),
+            1 => self.tasks.iter().map(|t| TuiRow::new(vec![t.title.clone(), t.status.clone(), t.priority.to_string()])).collect(),
+            2 => self.bugs.iter().map(|b| TuiRow::new(vec![b.id.to_string(), b.title.clone(), b.severity.clone(), b.status.clone()])).collect(),
+            3 => self.acceptance.iter().map(|a| TuiRow::new(vec![a.clone()])).collect(),
+            4 => self.assets.iter().map(|(n, s)| TuiRow::new(vec![n.clone(), s.clone()])).collect(),
+            _ => vec![],
+        };
+
+        let widths: Vec<Constraint> = cols.iter().filter(|c| c.visible)
+            .map(|c| Constraint::Percentage(c.width)).collect();
+
+        let border_style = if !self.focus_on_detail { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
+
+        let table = Table::new(rows, widths)
+            .header(TuiRow::new(header_cells).height(1).bottom_margin(1))
+            .block(Block::default().borders(Borders::ALL).title(format!(" {} ", key)).border_type(BorderType::Rounded).border_style(border_style))
+            .highlight_style(Style::default().bg(Color::Rgb(50, 50, 50)))
+            .highlight_symbol(">> ");
+
+        f.render_stateful_widget(table, area, &mut self.table_state.borrow_mut());
     }
 
-    fn render_bug_tab(&self, f: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = self.bugs.iter().map(|b| {
-            let color = if b.contains("P0") { Color::Red } else { Color::Yellow };
-            ListItem::new(format!(" 🐛 {}", b)).fg(color)
-        }).collect();
-        f.render_widget(List::new(items).block(Block::default().title(" 缺陷追踪 ").borders(Borders::ALL)), area);
-    }
+    fn render_detail_panel(&self, f: &mut Frame, area: Rect) {
+        let style = if self.focus_on_detail { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
+        let block = Block::default().borders(Borders::ALL).title(" 详细信息 ").border_type(BorderType::Rounded).border_style(style);
 
-    fn render_accept_tab(&self, f: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = self.acceptance.iter().map(|a| ListItem::new(format!(" ✅ {}", a)).white()).collect();
-        f.render_widget(List::new(items).block(Block::default().title(" 验收标准 ").borders(Borders::ALL)), area);
-    }
+        let content = if let Some(idx) = self.table_state.borrow().selected() {
+            match self.active_tab {
+                0 => self.projects.get(idx).map(|p| vec![
+                    Line::from(vec!["项目: ".into(), p.name.clone().yellow()]),
+                    Line::from(vec!["状态: ".into(), p.status.to_string().green()]),
+                ]),
+                2 => self.bugs.get(idx).map(|b| vec![
+                    Line::from(vec!["缺陷: ".into(), b.title.clone().red()]),
+                    Line::from(vec!["严重度: ".into(), b.severity.clone().on_red()]),
+                    Line::from(vec!["状态: ".into(), b.status.clone().cyan()]),
+                ]),
+                _ => Some(vec![Line::from("使用 j/k 浏览详情".italic().dark_gray())]),
+            }
+        } else { None };
 
-    fn render_asset_tab(&self, f: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = self.assets.iter().map(|a| ListItem::new(format!(" 🤖 {}", a)).white()).collect();
-        f.render_widget(List::new(items).block(Block::default().title(" 环境资产 ").borders(Borders::ALL)), area);
+        let widget = match content {
+            Some(t) => Paragraph::new(t).block(block).wrap(Wrap { trim: true }),
+            None => Paragraph::new("未选中数据").block(block).alignment(Alignment::Center),
+        };
+        f.render_widget(widget, area);
     }
 }
 
+// --- 实现 Component Trait (升级后版本) ---
 impl Component for QualityApp {
-    fn render(&self, f: &mut Frame, area: Rect) {
+    fn render(&self, f: &mut Frame, area: Rect, config: &AppConfig) {
         if self.is_loading {
-            let loading_text = Paragraph::new("正在拉取 AutoArk 质量数据...")
-                .yellow().alignment(Alignment::Center).block(Block::default().borders(Borders::ALL));
-            f.render_widget(loading_text, area);
+            f.render_widget(Paragraph::new("正在拉取数据库数据...").yellow().alignment(Alignment::Center), area);
             return;
         }
 
-        let main_layout = Layout::default().constraints([Constraint::Length(1), Constraint::Min(0)]).split(area);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
+
         let titles = vec![" [1]项目 ", " [2]任务 ", " [3]质量 ", " [4]验收 ", " [5]资产 "];
-        
         f.render_widget(
-            Tabs::new(titles).select(self.active_tab)
-                .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)).divider("|"),
-            main_layout[0]
+            Tabs::new(titles)
+                .select(self.active_tab)
+                .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                .divider("|"),
+            chunks[0]
         );
 
-        let content_area = main_layout[1];
-        if let Some(ref err) = self.error_msg {
-            let chunks = Layout::default().constraints([Constraint::Length(3), Constraint::Min(0)]).split(content_area);
-            f.render_widget(Paragraph::new(format!("⚠️ {}", err)).red().block(Block::default().borders(Borders::ALL)), chunks[0]);
-            self.draw_tab_content(f, chunks[1]);
-        } else {
-            self.draw_tab_content(f, content_area);
-        }
+        let work_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(chunks[1]);
 
-        // 如果处于编辑模式，可以在这里渲染一个弹窗 Overlay
-        if self.mode == QualityMode::Editing {
-            // TODO: 渲染弹出式编辑框
+        self.render_master_table(f, work_layout[0], config);
+        self.render_detail_panel(f, work_layout[1]);
+
+        if let Some(ref err) = self.error_msg {
+            let area = centered_rect(60, 10, area);
+            f.render_widget(Clear, area);
+            f.render_widget(Block::default().borders(Borders::ALL).title(" 异常提示 ").fg(Color::Red), area);
+            f.render_widget(Paragraph::new(err.as_str()).alignment(Alignment::Center), area);
         }
     }
 
     fn handle_event(&mut self, event: &AppEvent) -> Result<Option<CustomAction>> {
-        match event {
-            // 1. 处理按键事件
-            AppEvent::Key(key) => {
-                // 如果处于编辑模式，按键逻辑应完全不同
-                if self.mode == QualityMode::Editing {
-                    if key.code == KeyCode::Esc {
-                        self.mode = QualityMode::Normal;
-                    }
-                    // TODO: 处理编辑字符输入
-                    return Ok(None);
-                }
+        if let AppEvent::Key(key) = event {
+            match key.code {
+                KeyCode::Char('1') => { self.active_tab = 0; self.table_state.borrow_mut().select(Some(0)); return Ok(None); }
+                KeyCode::Char('2') => { self.active_tab = 1; self.table_state.borrow_mut().select(Some(0)); return Ok(None); }
+                KeyCode::Char('3') => { self.active_tab = 2; self.table_state.borrow_mut().select(Some(0)); return Ok(None); }
+                KeyCode::Char('4') => { self.active_tab = 3; self.table_state.borrow_mut().select(Some(0)); return Ok(None); }
+                KeyCode::Char('5') => { self.active_tab = 4; self.table_state.borrow_mut().select(Some(0)); return Ok(None); }
+                _ => {}
+            }
 
-                // 正常模式下的按键处理
-                match key.code {
-                    KeyCode::Char('r') => return Ok(Some(CustomAction::RefreshData)),
-                    KeyCode::Char('1') => self.active_tab = 0,
-                    KeyCode::Char('2') => self.active_tab = 1,
-                    KeyCode::Char('3') => self.active_tab = 2,
-                    KeyCode::Char('4') => self.active_tab = 3,
-                    KeyCode::Char('5') => self.active_tab = 4,
-                    KeyCode::Tab => self.active_tab = (self.active_tab + 1) % 5,
-                    KeyCode::Char('e') => self.mode = QualityMode::Editing, // 进入编辑模式示例
-                    _ => {}
+            match self.mode {
+                QualityMode::Normal => {
+                    match key.code {
+                        KeyCode::Char('f') => self.mode = QualityMode::HeaderFocus,
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            let len = match self.active_tab { 0 => self.projects.len(), 1 => self.tasks.len(), 2 => self.bugs.len(), 3 => self.acceptance.len(), 4 => self.assets.len(), _ => 0 };
+                            if len > 0 {
+                                let mut s = self.table_state.borrow_mut();
+                                let i = match s.selected() { Some(i) => if i >= len - 1 { 0 } else { i + 1 }, None => 0 };
+                                s.select(Some(i));
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            let len = match self.active_tab { 0 => self.projects.len(), 1 => self.tasks.len(), 2 => self.bugs.len(), 3 => self.acceptance.len(), 4 => self.assets.len(), _ => 0 };
+                            if len > 0 {
+                                let mut s = self.table_state.borrow_mut();
+                                let i = match s.selected() { Some(i) => if i == 0 { len - 1 } else { i - 1 }, None => 0 };
+                                s.select(Some(i));
+                            }
+                        }
+                        KeyCode::Left | KeyCode::Char('h') => self.focus_on_detail = false,
+                        KeyCode::Right | KeyCode::Char('l') => self.focus_on_detail = true,
+                        KeyCode::Char('r') => return Ok(Some(CustomAction::RefreshData)),
+                        _ => {}
+                    }
                 }
-                Ok(None)
+                QualityMode::HeaderFocus => {
+                    match key.code {
+                        KeyCode::Char('f') | KeyCode::Esc => self.mode = QualityMode::Normal,
+                        KeyCode::Left | KeyCode::Char('h') => { if self.column_index > 0 { self.column_index -= 1; } }
+                        KeyCode::Right | KeyCode::Char('l') => { self.column_index += 1; } 
+                        KeyCode::Enter => {
+                            return Ok(Some(CustomAction::SaveConfig));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
-            
-            // 2. 处理业务动作（意图驱动）
-            AppEvent::Action(CustomAction::RefreshData) => {
-                // 此处通常是在 main 循环中检测到此 Action 后，异步调用 refresh_data
-                // 组件内部可以选择记录一个状态位，或者清理 error_msg
-                self.error_msg = None;
-                Ok(None)
-            }
-            
-            _ => Ok(None)
         }
+        Ok(None)
     }
 }
 
-impl QualityApp {
-    fn draw_tab_content(&self, f: &mut Frame, area: Rect) {
-        match self.active_tab {
-            0 => self.render_biz_tab(f, area),
-            1 => self.render_task_tab(f, area),
-            2 => self.render_bug_tab(f, area),
-            3 => self.render_accept_tab(f, area),
-            4 => self.render_asset_tab(f, area),
-            _ => {}
-        }
-    }
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage((100 - percent_y) / 2), Constraint::Percentage(percent_y), Constraint::Percentage((100 - percent_y) / 2)])
+        .split(r);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage((100 - percent_x) / 2), Constraint::Percentage(percent_x), Constraint::Percentage((100 - percent_x) / 2)])
+        .split(popup_layout[1])[1]
 }

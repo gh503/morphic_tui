@@ -1,4 +1,5 @@
 use crate::framework::*;
+use crate::config::AppConfig;
 use ratatui::{prelude::*, widgets::*};
 use sysinfo::{Disks, Networks, System};
 use mac_address::mac_address_by_name;
@@ -129,7 +130,7 @@ impl Component for InfoApp {
         Ok(None)
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect) {
+    fn render(&self, frame: &mut Frame, area: Rect, _config: &AppConfig) {
         let main_chunks = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
         let top_chunks = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(main_chunks[0]);
         let bottom_chunks = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(main_chunks[1]);

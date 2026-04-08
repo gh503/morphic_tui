@@ -1,6 +1,7 @@
 // 核心 Trait 与事件定义
 use anyhow::Result;
 use ratatui::prelude::*;
+use crate::config::AppConfig;
 
 #[derive(Debug, Clone)]
 pub enum CustomAction {
@@ -13,6 +14,7 @@ pub enum CustomAction {
 
     RefreshData,          // 意图：发起刷新
     SyncDatabaseFinished, // 意图：刷新完成信号
+    SaveConfig,
     NotifySuccess(String),        // 意图：操作成功，要求系统弹出提示（Toast）
     NotifyError(String),          // 意图：操作失败
     UpdateTaskStatus { id: String, status: String }, // 意图：更新任务状态
@@ -27,5 +29,5 @@ pub enum AppEvent {
 
 pub trait Component {
     fn handle_event(&mut self, event: &AppEvent) -> Result<Option<CustomAction>>;
-    fn render(&self, frame: &mut Frame, area: Rect);
+    fn render(&self, frame: &mut Frame, area: Rect, config: &AppConfig);
 }

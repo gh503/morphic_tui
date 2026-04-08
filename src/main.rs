@@ -68,6 +68,8 @@ async fn run_app(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     terminal.draw(|f| app.render(f, f.area()))?;
 
     loop {
+        let mut should_render = false;
+
         // 2. 异步触发 Quality 数据库加载逻辑
         if app.active_tab == ActiveApp::Quality && !db_initialized {
             app.quality.is_loading = true;
@@ -120,7 +122,7 @@ async fn run_app(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                     }
                 }
                 // ✅ 仅在处理完有效事件后重绘
-                terminal.draw(|f| app.render(f, f.area()))?;
+                should_render = true;
             }
 
             // B. 定时刷新 (Tick)
@@ -128,8 +130,12 @@ async fn run_app(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                 app.handle_event(&AppEvent::Tick)?;
                 last_tick = Instant::now();
                 // ✅ 仅在 Tick 到达时重绘
-                terminal.draw(|f| app.render(f, f.area()))?;
+                should_render = true;
             }
+        }
+
+        if should_render {
+            terminal.draw(|f| app.render(f, f.area()))?;
         }
     }
 }

@@ -1,6 +1,7 @@
 // 圆角边框和基础状态显示
 use crate::framework::*;
 use ratatui::{prelude::*, widgets::*};
+use crate::config::AppConfig;
 use crate::app::ActiveApp;
 
 pub struct Sidebar {
@@ -116,7 +117,7 @@ impl Component for Sidebar {
         Ok(None)
     }
 
-    fn render(&self, _frame: &mut Frame, _area: Rect) {
+    fn render(&self, _frame: &mut Frame, _area: Rect, _config: &AppConfig) {
         // 由于使用了自定义的 render_with_state，这里留空
     }
 }

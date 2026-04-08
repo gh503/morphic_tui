@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, Borders};
 use crossterm::event::{MouseEvent, MouseEventKind, MouseButton};
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 pub struct RootApp {
     pub active_tab: ActiveApp,
@@ -31,6 +32,8 @@ pub struct RootApp {
     // 交互节流与状态
     pub is_dragging: bool,
     pub last_drag_time: Instant,
+
+    pub config: AppConfig, // 保存全局配置对象，方便跨组件传递
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -38,28 +41,20 @@ pub enum ActiveApp { Monitor, Settings, Info, Quality }
 
 impl RootApp {
     pub fn new() -> Self {
-        let config_result = confy::load::<AppConfig>("morphic_tui", None);
+        let config = confy::load::<AppConfig>("morphic_tui", None)
+            .unwrap_or_else(|_| AppConfig::default());
 
-        let (monitor, settings_points, sidebar_w, show_sb) = match config_result {
-            Ok(cfg) => (
-                MonitorApp::with_config(cfg.max_points),
-                cfg.max_points,
-                cfg.sidebar_width,
-                cfg.show_sidebar,
-            ),
-            Err(_) => (MonitorApp::new(), 100, 25, true),
-        };
-
-        let initial_width = if show_sb { sidebar_w } else { 0 };
+        let initial_width = if config.show_sidebar { config.sidebar_width } else { 0 };
+            
         Self {
             active_tab: ActiveApp::Monitor,
-            show_sidebar: show_sb,
-            monitor,
-            settings: SettingsApp { current_points: settings_points },
+            show_sidebar: config.show_sidebar,
+            monitor: MonitorApp::with_config(config.max_points),
+            settings: SettingsApp { current_points: config.max_points },
             info: InfoApp::new(),
             quality: QualityApp::new(),
             sidebar: Sidebar::new(),
-            sidebar_width: sidebar_w,
+            sidebar_width: config.sidebar_width,
             
             is_dragging: false,
             last_drag_time: Instant::now(),
@@ -67,15 +62,18 @@ impl RootApp {
             current_sidebar_width: RefCell::new(initial_width as f32),
             is_animating: RefCell::new(false),
             last_size: RefCell::new(Rect::default()),
+            config,
         }
     }
 
     pub fn save_config(&self) {
-        let cfg = AppConfig {
-            sidebar_width: self.sidebar_width,
-            max_points: self.monitor.max_points,
-            show_sidebar: self.show_sidebar,
-        };
+        // 同步最新的 UI 状态到 config 对象
+        let mut cfg = self.config.clone();
+        cfg.sidebar_width = self.sidebar_width;
+        cfg.show_sidebar = self.show_sidebar;
+
+        cfg.max_points = self.monitor.max_points;
+
         let _ = confy::store("morphic_tui", None, cfg);
     }
     
@@ -117,6 +115,11 @@ impl RootApp {
                             ActiveApp::Info => ActiveApp::Quality,
                             ActiveApp::Quality => ActiveApp::Monitor,
                         };
+                    },
+                    CustomAction::SaveConfig => {
+                        self.quality.toggle_sort(&mut self.config);
+                        self.save_config();
+                        return Ok(None);
                     }
                     _ => {}
                 }
@@ -129,25 +132,34 @@ impl RootApp {
         // 侧边栏是全局组件，始终接收事件（用于处理内部动画或菜单点击）
         let _ = self.sidebar.handle_event(event)?;
 
-        // 仅将事件分发给当前活跃的 Tab
-        // 这样当 active_tab 不是 Monitor 时，MonitorApp 就永远收不到 Tick，后台扫描彻底停止
-        match self.active_tab {
-            ActiveApp::Monitor => {
-                if let Some(a) = self.monitor.handle_event(event)? { pending_action = Some(a); }
+        // 【关键修正】：使用 let child_action 接收 match 的返回值
+        let child_action = match self.active_tab {
+            ActiveApp::Monitor => self.monitor.handle_event(event)?,
+            ActiveApp::Info => self.info.handle_event(event)?,
+            ActiveApp::Quality => self.quality.handle_event(event)?,
+            ActiveApp::Settings => self.settings.handle_event(event)?,
+        };
+
+        // --- 3. 统一 Action 后置处理 (解决一致性) ---
+        // 无论是全局触发的还是子组件返回的 Action，统一在这里做最终状态同步
+        if let Some(action) = child_action.or(pending_action) {
+            match &action {
+                CustomAction::SetHistory(new_val) => {
+                    // 同步配置对象
+                    self.config.max_points = *new_val;
+                    // 只有当我们在 Settings 页面调整时，Monitor 是收不到事件的，所以强制转发一次
+                    if self.active_tab == ActiveApp::Settings {
+                        self.monitor.handle_event(&AppEvent::Action(action.clone()))?;
+                    }
+                    // 立即保存，防止丢失
+                    self.save_config();
+                }
+                _ => {}
             }
-            ActiveApp::Info => {
-                if let Some(a) = self.info.handle_event(event)? { pending_action = Some(a); }
-            }
-            ActiveApp::Quality => {
-                // QualityApp 如果有 Action 也需要接收
-                let _ = self.quality.handle_event(event)?;
-            }
-            ActiveApp::Settings => {
-                if let Some(a) = self.settings.handle_event(event)? { pending_action = Some(a); }
-            }
+            return Ok(Some(action));
         }
 
-        Ok(pending_action)
+        Ok(None)
     }
 
     fn handle_mouse_logic(&mut self, mouse: MouseEvent, sidebar_area: Rect) -> Option<CustomAction> {
@@ -236,10 +248,10 @@ impl RootApp {
         }
 
         match self.active_tab {
-            ActiveApp::Monitor => self.monitor.render(f, chunks[1]),
-            ActiveApp::Settings => self.settings.render(f, chunks[1]),
-            ActiveApp::Info => self.info.render(f, chunks[1]),
-            ActiveApp::Quality => self.quality.render(f, chunks[1]),
+            ActiveApp::Monitor => self.monitor.render(f, chunks[1], &self.config),
+            ActiveApp::Settings => self.settings.render(f, chunks[1], &self.config),
+            ActiveApp::Info => self.info.render(f, chunks[1], &self.config),
+            ActiveApp::Quality => self.quality.render(f, chunks[1], &self.config),
         }
     }
 }

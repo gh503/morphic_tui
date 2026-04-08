@@ -1,5 +1,6 @@
 // 系统监控 (优化版：精细化刷新与性能隔离)
 use crate::framework::*;
+use crate::config::AppConfig;
 use std::collections::VecDeque;
 use std::cell::RefCell;
 use ratatui::{prelude::*, widgets::*, symbols::Marker};
@@ -148,7 +149,7 @@ impl Component for MonitorApp {
         Ok(None)
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect) {
+    fn render(&self, frame: &mut Frame, area: Rect, config: &AppConfig) {
         self.ensure_grid_cache();
 
         let chunks = Layout::vertical([
@@ -183,10 +184,10 @@ impl Component for MonitorApp {
             .graph_type(GraphType::Line)
             .style(Style::default().fg(Color::Yellow).bold())
             .data(&cpu_points));
-
+        
         let chart = Chart::new(datasets)
             .block(Block::bordered().title(" CPU 实时负载 ").border_type(BorderType::Rounded))
-            .x_axis(Axis::default().bounds([0.0, self.max_points as f64]))
+            .x_axis(Axis::default().bounds([0.0, config.max_points as f64]))
             .y_axis(Axis::default().bounds([0.0, 100.0]).labels(vec![Line::from("0"), Line::from("50"), Line::from("100")]));
         frame.render_widget(chart, chunks[1]);
 
