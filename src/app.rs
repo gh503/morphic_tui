@@ -1,17 +1,16 @@
-// 负责组件的实例化和布局声明
+// src/app.rs
 use crate::framework::*;
 use crate::config::AppConfig;
 use crate::apps::monitor::MonitorApp;
 use crate::apps::settings::SettingsApp;
 use crate::apps::info::InfoApp;
-use crate::apps::quality::QualityApp;
+use crate::apps::quality::{QualityApp, QualityMode}; // ✅ 引入 QualityMode
 use crate::components::Sidebar;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders};
 use crossterm::event::{MouseEvent, MouseEventKind, MouseButton};
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
 
 pub struct RootApp {
     pub active_tab: ActiveApp,
@@ -21,19 +20,14 @@ pub struct RootApp {
     pub info: InfoApp,
     pub quality: QualityApp,
     pub sidebar: Sidebar,
-    pub sidebar_width: u16,  // 用户设定的目标常态宽度
-
-    // 动画状态
+    pub sidebar_width: u16,  
     pub target_sidebar_width: u16, 
     pub current_sidebar_width: RefCell<f32>, 
     pub is_animating: RefCell<bool>,
     pub last_size: RefCell<Rect>,
-    
-    // 交互节流与状态
     pub is_dragging: bool,
     pub last_drag_time: Instant,
-
-    pub config: AppConfig, // 保存全局配置对象，方便跨组件传递
+    pub config: AppConfig, 
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -41,8 +35,10 @@ pub enum ActiveApp { Monitor, Settings, Info, Quality }
 
 impl RootApp {
     pub fn new() -> Self {
-        let config = confy::load::<AppConfig>("morphic_tui", None)
+        let mut config = confy::load::<AppConfig>("morphic_tui", None)
             .unwrap_or_else(|_| AppConfig::default());
+
+        config.validate();
 
         let initial_width = if config.show_sidebar { config.sidebar_width } else { 0 };
             
@@ -55,7 +51,6 @@ impl RootApp {
             quality: QualityApp::new(),
             sidebar: Sidebar::new(),
             sidebar_width: config.sidebar_width,
-            
             is_dragging: false,
             last_drag_time: Instant::now(),
             target_sidebar_width: initial_width,
@@ -67,20 +62,23 @@ impl RootApp {
     }
 
     pub fn save_config(&self) {
-        // 同步最新的 UI 状态到 config 对象
         let mut cfg = self.config.clone();
         cfg.sidebar_width = self.sidebar_width;
         cfg.show_sidebar = self.show_sidebar;
-
         cfg.max_points = self.monitor.max_points;
-
         let _ = confy::store("morphic_tui", None, cfg);
     }
     
     pub fn handle_event(&mut self, event: &AppEvent) -> anyhow::Result<Option<CustomAction>> {
+        // --- 核心拦截：如果 Quality 正在录入，屏蔽 Root 层的全局按键 ---
+        if let AppEvent::Key(_) = event {
+            if self.active_tab == ActiveApp::Quality && self.quality.mode == QualityMode::Editing {
+                return self.quality.handle_event(event);
+            }
+        }
+
         let mut pending_action = None;
 
-        // --- 1. 全局事件处理 (保持不变) ---
         match event {
             AppEvent::Mouse(mouse) => {
                 if let MouseEventKind::Drag(_) = mouse.kind {
@@ -107,6 +105,7 @@ impl RootApp {
                         self.show_sidebar = !self.show_sidebar;
                         self.target_sidebar_width = if self.show_sidebar { self.sidebar_width } else { 0 };
                         self.is_animating.replace(true);
+                        self.save_config();
                     },
                     CustomAction::NextApp => {
                         self.active_tab = match self.active_tab {
@@ -117,9 +116,29 @@ impl RootApp {
                         };
                     },
                     CustomAction::SaveConfig => {
+                        let tab_key = self.quality.get_current_tab_key(); // "projects", "tasks" 等
+
+                        // 1. 改变配置状态 (None -> Asc -> Desc)
+                        // 注意：这里一定要先 toggle，config 里的 sort 才会变
                         self.quality.toggle_sort(&mut self.config);
-                        self.save_config();
-                        return Ok(None);
+
+                        // 2. 拿到最新的列信息并强制排序
+                        if let Some(cols) = self.config.table_columns.get(tab_key) {
+                            let visible_cols: Vec<_> = cols.iter().filter(|c| c.visible).collect();
+                            if let Some(target_col) = visible_cols.get(self.quality.column_index) {
+                                
+                                // --- 调试大法：如果你不确定这里是否执行，可以加一行 println ---
+                                println!("Sorting Tab: {}, Col: {}, Order: {:?}", tab_key, target_col.name, target_col.sort);
+                                
+                                self.quality.apply_sort(tab_key, &target_col.name, target_col.sort.clone());
+                            }
+                        }
+
+                        // 3. 退出 HeaderFocus 模式，回到列表浏览
+                        self.quality.mode = QualityMode::Normal;
+
+                        // 4. 持久化
+                        let _ = self.config.save();
                     }
                     _ => {}
                 }
@@ -127,12 +146,9 @@ impl RootApp {
             _ => {}
         }
 
-        // --- 2. [核心优化] 转发给子组件：按需分发 ---
-        
-        // 侧边栏是全局组件，始终接收事件（用于处理内部动画或菜单点击）
         let _ = self.sidebar.handle_event(event)?;
 
-        // 【关键修正】：使用 let child_action 接收 match 的返回值
+        // 分发给子 App
         let child_action = match self.active_tab {
             ActiveApp::Monitor => self.monitor.handle_event(event)?,
             ActiveApp::Info => self.info.handle_event(event)?,
@@ -140,18 +156,14 @@ impl RootApp {
             ActiveApp::Settings => self.settings.handle_event(event)?,
         };
 
-        // --- 3. 统一 Action 后置处理 (解决一致性) ---
-        // 无论是全局触发的还是子组件返回的 Action，统一在这里做最终状态同步
+        // 处理最终 Action
         if let Some(action) = child_action.or(pending_action) {
             match &action {
                 CustomAction::SetHistory(new_val) => {
-                    // 同步配置对象
                     self.config.max_points = *new_val;
-                    // 只有当我们在 Settings 页面调整时，Monitor 是收不到事件的，所以强制转发一次
                     if self.active_tab == ActiveApp::Settings {
                         self.monitor.handle_event(&AppEvent::Action(action.clone()))?;
                     }
-                    // 立即保存，防止丢失
                     self.save_config();
                 }
                 _ => {}
@@ -163,61 +175,54 @@ impl RootApp {
     }
 
     fn handle_mouse_logic(&mut self, mouse: MouseEvent, sidebar_area: Rect) -> Option<CustomAction> {
-        // 即使 show_sidebar 为 false，如果是动画中也应该允许判定（或者直接返回）
         let visual_width = sidebar_area.width;
-
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // 增加容错：边缘 2 个字符宽度内均判定为拖拽开始
                 if mouse.column >= visual_width.saturating_sub(2) && mouse.column <= visual_width + 1 {
                     self.is_dragging = true;
-                    // 开启拖拽时，关闭动画干扰，强制同步
                     self.is_animating.replace(false);
-                } 
-                else if mouse.column < visual_width {
-                    // 侧边栏菜单点击 (基于相对行号)
+                    None
+                } else if mouse.column < visual_width {
                     let relative_row = mouse.row.saturating_sub(sidebar_area.y);
                     match relative_row {
-                        // 这里的行号需根据 sidebar.rs 的实际渲染位置微调
-                        4..=6 => return Some(CustomAction::NextApp),
-                        _ => {}
+                        // 根据 Sidebar 布局映射点击区域切换 App
+                        4..=5 => Some(CustomAction::NextApp), // 简化的逻辑
+                        _ => None
                     }
-                }
+                } else { None }
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.is_dragging {
                     self.is_dragging = false;
-                    // 释放时，同步目标宽度，防止动画回弹
                     self.sidebar_width = visual_width; 
                     self.target_sidebar_width = visual_width;
+                    self.save_config();
                 }
+                None
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.is_dragging {
-                    // 实时更新宽度并同步动画中间值
                     let new_w = mouse.column.clamp(10, 60);
                     self.sidebar_width = new_w;
                     self.current_sidebar_width.replace(new_w as f32);
                 }
+                None
             }
-            _ => {}
+            _ => None,
         }
-        None
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect) {
         self.last_size.replace(area);
-
-        // 动画引擎
+        
+        // 侧边栏动画逻辑
         let is_animating_val = *self.is_animating.borrow();
         if is_animating_val {
             let target = self.target_sidebar_width as f32;
             let current = *self.current_sidebar_width.borrow();
             let diff = target - current;
-
             if diff.abs() > 0.1 {
-                let step = diff * 0.25; // 稍微调快一点响应
-                self.current_sidebar_width.replace(current + step);
+                self.current_sidebar_width.replace(current + diff * 0.25);
             } else {
                 self.current_sidebar_width.replace(target);
                 self.is_animating.replace(false);
@@ -225,28 +230,20 @@ impl RootApp {
         }
 
         let current_w = *self.current_sidebar_width.borrow() as u16;
-
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(current_w),
-                Constraint::Min(0),
-            ])
+            .constraints([Constraint::Length(current_w), Constraint::Min(0)])
             .split(area);
 
         if current_w > 0 {
             let current_cpu = self.monitor.cpu_history.back().cloned().unwrap_or(0.0);
             self.sidebar.render_with_state(f, chunks[0], &self.active_tab, current_cpu);
-
-            // 拖拽视觉反馈：高亮右边界线
             if self.is_dragging {
-                let drag_block = Block::default()
-                    .borders(Borders::RIGHT)
-                    .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
-                f.render_widget(drag_block, chunks[0]);
+                f.render_widget(Block::default().borders(Borders::RIGHT).border_style(Style::default().fg(Color::Yellow)), chunks[0]);
             }
         }
 
+        // 渲染主内容区
         match self.active_tab {
             ActiveApp::Monitor => self.monitor.render(f, chunks[1], &self.config),
             ActiveApp::Settings => self.settings.render(f, chunks[1], &self.config),

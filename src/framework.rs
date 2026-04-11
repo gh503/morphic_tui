@@ -1,23 +1,21 @@
-// 核心 Trait 与事件定义
+// src/framework.rs
 use anyhow::Result;
 use ratatui::prelude::*;
 use crate::config::AppConfig;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CustomAction {
     UpdateCpu(f32),
-    UpdateMemory { used: u64, total: u64 }, // 新增：内存数据
+    UpdateMemory { used: u64, total: u64 },
     ToggleSidebar,
     NextApp,
-    SetHistory(usize), // 新增：动态调整历史点数
-    ResizeSidebar(u16), // 新增：设置侧边栏绝对宽度
-
-    RefreshData,          // 意图：发起刷新
-    SyncDatabaseFinished, // 意图：刷新完成信号
+    SetHistory(usize),
+    ResizeSidebar(u16),
+    RefreshData,
+    SyncDatabaseFinished,
     SaveConfig,
-    NotifySuccess(String),        // 意图：操作成功，要求系统弹出提示（Toast）
-    NotifyError(String),          // 意图：操作失败
-    UpdateTaskStatus { id: String, status: String }, // 意图：更新任务状态
+    NotifySuccess(String),
+    NotifyError(String),
 }
 
 pub enum AppEvent {

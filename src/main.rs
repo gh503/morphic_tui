@@ -6,6 +6,7 @@ mod app;
 mod config;
 mod database; 
 mod models;   
+mod repositories; // ✅ 新增：引入数据仓库模块
 
 use anyhow::Result;
 use framework::*;
@@ -13,6 +14,7 @@ use app::{RootApp, ActiveApp};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use std::panic;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,10 +30,10 @@ async fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
 
-    // 4. 运行应用主循环
+    // 3. 运行应用主循环
     let outcome = run_app(&mut terminal).await;
 
-    // 5. 正常退出逻辑
+    // 4. 正常退出逻辑
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
 
@@ -39,7 +41,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run_app(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel(100);
+    // 创建全局通信通道
+    let (tx, mut rx) = mpsc::channel::<AppEvent>(100);
     let mut app = RootApp::new();
 
     // 1. 事件监听任务 (输入流)
@@ -64,64 +67,74 @@ async fn run_app(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     let mut last_tick = Instant::now();
     let mut db_initialized = false;
 
-    // 初始渲染：保证启动时屏幕不是空白
+    // 初始渲染
     terminal.draw(|f| app.render(f, f.area()))?;
 
     loop {
         let mut should_render = false;
 
         // 2. 异步触发 Quality 数据库加载逻辑
+        // 当切换到 Quality 标签页且未初始化时触发
         if app.active_tab == ActiveApp::Quality && !db_initialized {
             app.quality.is_loading = true;
             let refresh_tx = tx.clone();
             tokio::spawn(async move {
-                // 模拟一个异步通知，避免在初始化时阻塞 UI
+                // 触发确保数据库连接和 Repository 初始化的逻辑
                 let _ = refresh_tx.send(AppEvent::Action(CustomAction::RefreshData)).await;
             });
             db_initialized = true; 
         }
 
-        // 3. 计算距离下一次 Tick 的剩余时间
+        // 3. 计算下一次 Tick 的超时时间
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         
-        // 4. 事件驱动驱动核心：只在有变动时才唤醒
         tokio::select! {
             // A. 处理用户输入或自定义 Action
             Some(event) = rx.recv() => {
                 match event {
-                    // 全局退出
+                    // 全局退出 (仅在 Normal 模式下允许，防止编辑时误触退出)
                     AppEvent::Key(k) if k.code == crossterm::event::KeyCode::Char('q') 
                         && app.quality.mode == apps::quality::QualityMode::Normal => {
                         app.save_config();
                         return Ok(());
                     },
                     
-                    // 异步数据库同步逻辑
+                    // 核心逻辑：刷新/初始化数据库
                     AppEvent::Action(CustomAction::RefreshData) => {
+                        // ensure_db 内部现在会创建 Repository
                         if let Err(e) = app.quality.ensure_db().await {
-                            app.quality.error_msg = Some(format!("Init Error: {}", e));
+                            app.quality.error_msg = Some(format!("Database Error: {}", e));
                             app.quality.is_loading = false;
                         } else {
+                            // 刷新数据后，发送同步完成通知
                             let tx_done = tx.clone();
                             tokio::spawn(async move {
-                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                // 给予微小的延迟确保 UI 状态切换平滑
+                                tokio::time::sleep(Duration::from_millis(20)).await;
                                 let _ = tx_done.send(AppEvent::Action(CustomAction::SyncDatabaseFinished)).await;
                             });
                         }
                     }
 
+                    // 数据库同步完成
                     AppEvent::Action(CustomAction::SyncDatabaseFinished) => {
                         app.quality.is_loading = false;
+                        should_render = true;
+                    }
+
+                    // 保存配置 Action
+                    AppEvent::Action(CustomAction::SaveConfig) => {
+                        app.save_config();
                     }
 
                     // 常规业务事件分发
                     _ => {
                         if let Some(action) = app.handle_event(&event)? {
+                            // 如果 handle_event 返回了 Action（例如 Enter 提交后触发刷新），将其送回队列
                             let _ = tx.send(AppEvent::Action(action)).await;
                         }
                     }
                 }
-                // ✅ 仅在处理完有效事件后重绘
                 should_render = true;
             }
 
@@ -129,7 +142,6 @@ async fn run_app(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             _ = tokio::time::sleep(timeout) => {
                 app.handle_event(&AppEvent::Tick)?;
                 last_tick = Instant::now();
-                // ✅ 仅在 Tick 到达时重绘
                 should_render = true;
             }
         }
